@@ -1,9 +1,17 @@
 # server.py
 import asyncio
+import sys
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse
 
+# Ensure current directory (jahan server.py hai) sys.path me ho
+BASE_DIR = Path(__file__).resolve().parent
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+
+# Ab yaha se bot import karega
 from bot import app as tg_app  # pyrogram Client
 from utils.cleanup import cleanup_worker
 
@@ -13,7 +21,7 @@ fastapi_app = FastAPI(title="Serena Unzip Web Service")
 
 @fastapi_app.on_event("startup")
 async def on_startup():
-    # start background cleanup worker
+    # background cleanup worker
     asyncio.create_task(cleanup_worker())
 
     # start Telegram bot client
