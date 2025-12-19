@@ -1,12 +1,12 @@
 import asyncio
-import math
 import os
 import shutil
 import uuid
 from pathlib import Path
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional
 
-from pyrogram import Client, filters, enums
+from aiohttp import web
+from pyrogram import Client, filters, enums, idle
 from pyrogram.types import (
     Message,
     InlineKeyboardMarkup,
@@ -28,7 +28,10 @@ from utils.progress import progress_for_pyrogram, human_bytes
 from utils.extractors import extract_archive, extract_single_file, detect_encrypted
 from utils.link_parser import find_links_in_text, extract_links_from_folder
 from utils.cleanup import cleanup_worker
+from utils.media_tools import extract_audio
 
+
+# ----------------- Pyrogram client -----------------
 
 app = Client(
     "serena_unzip_bot",
@@ -51,10 +54,11 @@ def get_lock(user_id: int) -> asyncio.Lock:
     return user_locks[user_id]
 
 
-# ---------- helpers ----------
-
 def is_owner(user_id: int) -> bool:
     return user_id in Config.OWNER_IDS
+
+
+# ----------------- helpers -----------------
 
 
 async def check_force_sub(client: Client, message: Message) -> bool:
@@ -62,14 +66,22 @@ async def check_force_sub(client: Client, message: Message) -> bool:
         return True
     try:
         member = await client.get_chat_member(Config.FORCE_SUB_CHANNEL, message.from_user.id)
-        if member.status not in (enums.ChatMemberStatus.OWNER, enums.ChatMemberStatus.ADMINISTRATOR,
-                                 enums.ChatMemberStatus.MEMBER):
+        if member.status not in (
+            enums.ChatMemberStatus.OWNER,
+            enums.ChatMemberStatus.ADMINISTRATOR,
+            enums.ChatMemberStatus.MEMBER,
+        ):
             raise ValueError
         return True
     except Exception:
         kb = InlineKeyboardMarkup(
             [
-                [InlineKeyboardButton("Join official channel", url=f"https://t.me/{Config.FORCE_SUB_CHANNEL}")],
+                [
+                    InlineKeyboardButton(
+                        "Join official channel",
+                        url=f"https://t.me/{Config.FORCE_SUB_CHANNEL}",
+                    )
+                ],
                 [InlineKeyboardButton("Try again", callback_data="retry_force_sub")],
             ]
         )
@@ -83,31 +95,51 @@ async def check_force_sub(client: Client, message: Message) -> bool:
 def start_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("Join official channel", url=f"https://t.me/{Config.FORCE_SUB_CHANNEL}")],
-            [InlineKeyboardButton("Owner Contact", url=f"https://t.me/{Config.OWNER_USERNAME}")],
+            [
+                InlineKeyboardButton(
+                    "Join official channel",
+                    url=f"https://t.me/{Config.FORCE_SUB_CHANNEL}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "Owner Contact",
+                    url=f"https://t.me/{Config.OWNER_USERNAME}",
+                )
+            ],
         ]
     )
 
 
-def file_action_keyboard(msg: Message, is_archive: bool, is_video: bool) -> InlineKeyboardMarkup:
+def file_action_keyboard(msg: Message, is_archive: bool, is_video: bool) -> Optional[InlineKeyboardMarkup]:
     buttons = []
     if is_archive:
         buttons.append(
             [
-                InlineKeyboardButton("📦 Unzip", callback_data=f"unzip|{msg.chat.id}|{msg.id}|nopass"),
-                InlineKeyboardButton("🔐 With Password", callback_data=f"unzip|{msg.chat.id}|{msg.id}|askpass"),
+                InlineKeyboardButton(
+                    "📦 Unzip",
+                    callback_data=f"unzip|{msg.chat.id}|{msg.id}|nopass",
+                ),
+                InlineKeyboardButton(
+                    "🔐 With Password",
+                    callback_data=f"unzip|{msg.chat.id}|{msg.id}|askpass",
+                ),
             ]
         )
     if is_video:
         buttons.append(
             [
-                InlineKeyboardButton("🎧 Extract Audio", callback_data=f"audio|{msg.chat.id}|{msg.id}"),
+                InlineKeyboardButton(
+                    "🎧 Extract Audio",
+                    callback_data=f"audio|{msg.chat.id}|{msg.id}",
+                ),
             ]
         )
     return InlineKeyboardMarkup(buttons) if buttons else None
 
 
-# ---------- commands ----------
+# ----------------- commands -----------------
+
 
 @app.on_message(filters.command("start") & filters.private)
 async def start_cmd(client: Client, message: Message):
@@ -158,7 +190,7 @@ async def help_cmd(client: Client, message: Message):
         "• Send .txt or link list → bot parses direct/m3u8/GDrive/Telegram links\n\n"
         "<b>Admin only</b>\n"
         "/status – active users & storage\n"
-        "/users – user stats\n"
+        "/users – alias of /status\n"
         "/broadcast – reply to a message & run /broadcast\n"
         "/clean – force temp cleanup\n"
         "/ban /unban – by reply or user id\n"
@@ -169,10 +201,13 @@ async def help_cmd(client: Client, message: Message):
 @app.on_message(filters.command("cancel") & filters.private)
 async def cancel_cmd(client: Client, message: Message):
     user_cancelled[message.from_user.id] = True
-    await message.reply_text("Aight, current task ko cancel mode pe daal diya. Next step se skip hoga 😉")
+    await message.reply_text(
+        "Aight, current task ko cancel mode pe daal diya. Next step se skip hoga 😉"
+    )
 
 
-# ---------- admin commands ----------
+# ----------------- admin commands -----------------
+
 
 @app.on_message(filters.command(["status", "users"]) & filters.private)
 async def status_cmd(client: Client, message: Message):
@@ -181,7 +216,6 @@ async def status_cmd(client: Client, message: Message):
 
     total, premium, banned = await count_users()
 
-    # disk usage
     total_b = used_b = free_b = 0
     try:
         st = shutil.disk_usage("/")
@@ -257,11 +291,13 @@ async def clean_cmd(client: Client, message: Message):
     if not is_owner(message.from_user.id):
         return
 
-    # Cleanup worker already running periodic; here just manual
-    await message.reply_text("Manual cleanup triggered (background pe chalega).")
+    await message.reply_text(
+        "Manual cleanup trigger ho gaya (background worker already run ho raha hai)."
+    )
 
 
-# ---------- main file handlers ----------
+# ----------------- file handlers -----------------
+
 
 ARCHIVE_EXTENSIONS = (".zip", ".rar", ".7z", ".tar", ".gz", ".tgz", ".tar.gz")
 
@@ -303,13 +339,16 @@ async def on_file(client: Client, message: Message):
     if kb:
         await message.reply_text(
             f"Nice drop: <code>{file_name}</code>\nChoose what you wanna do 👇",
-            reply_markup=kb
+            reply_markup=kb,
         )
     else:
-        await message.reply_text("File mila, but abhi is type pe koi special action set nahi hai.")
+        await message.reply_text(
+            "File mila, but abhi is type pe koi special action set nahi hai."
+        )
 
 
-# ---------- text / links handler (DM) ----------
+# ----------------- text / links handler -----------------
+
 
 @app.on_message(filters.text & filters.private)
 async def on_text(client: Client, message: Message):
@@ -317,7 +356,7 @@ async def on_text(client: Client, message: Message):
     if await is_banned(user_id):
         return
 
-    # check if this is password reply
+    # password reply?
     if user_id in pending_password:
         info = pending_password.pop(user_id)
         password = message.text.strip()
@@ -329,40 +368,36 @@ async def on_text(client: Client, message: Message):
 
     await get_or_create_user(user_id)
 
-    # parse links
-    links = find_links_in_text(message.text)
+    links = find_links_in_text(message.text or "")
     if not links:
-        await message.reply_text("Just text. Agar links ya archive bhejna hai toh drop it here.")
+        await message.reply_text(
+            "Just text. Agar links ya archive bhejna hai toh drop it here."
+        )
         return
 
-    # show link options (power feature skeleton)
     kb = InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("⬇️ Download all videos/files", callback_data="links|download_all"),
+                InlineKeyboardButton(
+                    "⬇️ Download all videos/files", callback_data="links|download_all"
+                ),
             ],
             [
-                InlineKeyboardButton("🧹 Cleaned TXT only", callback_data="links|clean_txt"),
+                InlineKeyboardButton(
+                    "🧹 Cleaned TXT only", callback_data="links|clean_txt"
+                ),
                 InlineKeyboardButton("Skip", callback_data="links|skip"),
             ],
         ]
     )
     await message.reply_text(
-        f"Found <b>{len(links)}</b> urls.\nChoose what to do:",
-        reply_markup=kb
+        f"Found <b>{len(links)}</b> urls.\nChoose what to do:", reply_markup=kb
     )
-
-    # stash in tasks map
-    task_id = uuid.uuid4().hex
-    tasks[task_id] = {
-        "type": "links",
-        "user_id": user_id,
-        "links": links,
-    }
-    # we encode task_id in future if needed (keeping skeleton simple)
+    # (skeleton: full auto‑download logic baad me add kar sakte ho)
 
 
-# ---------- callback handlers ----------
+# ----------------- callback handlers -----------------
+
 
 @app.on_callback_query()
 async def callbacks(client: Client, cq: CallbackQuery):
@@ -394,18 +429,19 @@ async def callbacks(client: Client, cq: CallbackQuery):
         return
 
     if data.startswith("links|"):
-        # skeleton: we only implement clean_txt / skip msg here
         action = data.split("|", 1)[1]
         if action == "clean_txt":
-            # in this skeleton, we just re‑parse from replied message
             if cq.message.reply_to_message:
-                links = find_links_in_text(cq.message.reply_to_message.text or "")
-                txt = "\n".join(sorted(set(links))) or "No valid URLs found."
-                await cq.message.edit_text(
-                    "<b>Cleaned URLs:</b>\n\n" + txt[:4000]
+                links = find_links_in_text(
+                    cq.message.reply_to_message.text or ""
                 )
+                txt = "\n".join(sorted(set(links))) or "No valid URLs found."
+                await cq.message.edit_text("<b>Cleaned URLs:</b>\n\n" + txt[:4000])
         elif action == "download_all":
-            await cq.answer("Auto‑download from links: skeleton only; implement as needed.", show_alert=True)
+            await cq.answer(
+                "Auto‑download from links: skeleton only; implement as needed.",
+                show_alert=True,
+            )
         else:
             await cq.message.edit_text("Skipped link processing.")
         return
@@ -413,9 +449,12 @@ async def callbacks(client: Client, cq: CallbackQuery):
     await cq.answer()
 
 
-# ---------- unzip flow ----------
+# ----------------- unzip flow -----------------
 
-async def handle_unzip_button(client: Client, cq: CallbackQuery, original_msg: Message, mode: str):
+
+async def handle_unzip_button(
+    client: Client, cq: CallbackQuery, original_msg: Message, mode: str
+):
     user_id = cq.from_user.id
     if await is_banned(user_id):
         await cq.answer("You are banned.", show_alert=True)
@@ -436,22 +475,24 @@ async def handle_unzip_button(client: Client, cq: CallbackQuery, original_msg: M
         return
 
     if mode == "askpass":
-        # ask user to send password
         pending_password[user_id] = {
             "chat_id": original_msg.chat.id,
             "msg_id": original_msg.id,
             "file_name": file_name,
         }
-        await cq.message.reply_text(f"Password bhejo for <code>{file_name}</code> (just text).")
+        await cq.message.reply_text(
+            f"Password bhejo for <code>{file_name}</code> (just text)."
+        )
         await cq.answer()
         return
 
-    # no password mode
     await cq.answer()
     await run_unzip_task(client, original_msg, password=None)
 
 
-async def handle_unzip_from_password(client: Client, msg: Message, info: Dict[str, Any], password: str):
+async def handle_unzip_from_password(
+    client: Client, msg: Message, info: Dict[str, Any], password: str
+):
     chat_id = info["chat_id"]
     msg_id = info["msg_id"]
     original_msg = await client.get_messages(chat_id, msg_id)
@@ -464,7 +505,9 @@ async def run_unzip_task(client: Client, msg: Message, password: Optional[str]):
     lock = get_lock(user_id)
 
     if lock.locked():
-        await msg.reply_text("Chill, ek task already running hai. Pehle usko finish hone do.")
+        await msg.reply_text(
+            "Chill, ek task already running hai. Pehle usko finish hone do."
+        )
         return
 
     async with lock:
@@ -475,14 +518,14 @@ async def run_unzip_task(client: Client, msg: Message, password: Optional[str]):
         size_mb = size_bytes / (1024 * 1024)
 
         await get_or_create_user(user_id)
-        # basic free/premium checks could be added here (skipped for brevity)
 
         temp_root = Path(Config.TEMP_DIR) / str(user_id) / uuid.uuid4().hex
         temp_root.mkdir(parents=True, exist_ok=True)
         archive_path = str(temp_root / file_name)
 
-        # register for cleanup
-        await register_temp_path(user_id, str(temp_root), Config.AUTO_DELETE_DEFAULT_MIN)
+        await register_temp_path(
+            user_id, str(temp_root), Config.AUTO_DELETE_DEFAULT_MIN
+        )
 
         status_msg = await msg.reply_text("Downloading archive to server…")
 
@@ -510,7 +553,6 @@ async def run_unzip_task(client: Client, msg: Message, password: Optional[str]):
             )
             return
 
-        # extract
         await status_msg.edit_text("Extraction shuru… Thoda sabr 😎")
         extract_dir = temp_root / "extracted"
         try:
@@ -520,16 +562,17 @@ async def run_unzip_task(client: Client, msg: Message, password: Optional[str]):
             return
 
         if user_cancelled.get(user_id):
-            await status_msg.edit_text("Task cancel ho gaya mid‑way, output skip kar diya.")
+            await status_msg.edit_text(
+                "Task cancel ho gaya mid‑way, output skip kar diya."
+            )
             return
 
         stats = result["stats"]
         files = result["files"]
 
-        # links analysis inside extracted files
+        # links analysis
         links_map = extract_links_from_folder(str(extract_dir))
 
-        # prepare task context for sendone/sendall
         task_id = uuid.uuid4().hex
         tasks[task_id] = {
             "type": "unzip",
@@ -538,7 +581,6 @@ async def run_unzip_task(client: Client, msg: Message, password: Optional[str]):
             "files": files,
         }
 
-        # summary
         summary = (
             f"<b>Extraction done ✅</b>\n\n"
             f"Archive: <code>{file_name}</code>\n"
@@ -553,7 +595,6 @@ async def run_unzip_task(client: Client, msg: Message, password: Optional[str]):
             f"• Telegram: {len(links_map.get('telegram', []))}\n"
         )
 
-        # buttons: per file (limited) + send all
         rows = []
         max_files_buttons = 25
         for idx, rel_path in enumerate(files[:max_files_buttons]):
@@ -564,7 +605,13 @@ async def run_unzip_task(client: Client, msg: Message, password: Optional[str]):
                 [InlineKeyboardButton(short, callback_data=f"sendone|{task_id}|{idx}")]
             )
 
-        rows.append([InlineKeyboardButton("🚀 Send ALL files", callback_data=f"sendall|{task_id}")])
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "🚀 Send ALL files", callback_data=f"sendall|{task_id}"
+                )
+            ]
+        )
 
         kb = InlineKeyboardMarkup(rows)
 
@@ -588,7 +635,9 @@ async def handle_send_all(client: Client, cq: CallbackQuery, task_id: str):
     files = info["files"]
 
     await cq.answer()
-    await cq.message.edit_text("Sending all extracted files… thoda time lag sakta hai.")
+    await cq.message.edit_text(
+        "Sending all extracted files… thoda time lag sakta hai."
+    )
 
     for rel in files:
         full = base_dir / rel
@@ -604,7 +653,9 @@ async def handle_send_all(client: Client, cq: CallbackQuery, task_id: str):
         await asyncio.sleep(0.5)
 
 
-async def handle_send_one(client: Client, cq: CallbackQuery, task_id: str, index: int):
+async def handle_send_one(
+    client: Client, cq: CallbackQuery, task_id: str, index: int
+):
     info = tasks.get(task_id)
     if not info:
         await cq.answer("Task expired ya clean ho chuka hai.", show_alert=True)
@@ -634,9 +685,7 @@ async def handle_send_one(client: Client, cq: CallbackQuery, task_id: str, index
     )
 
 
-# ---------- extract audio ----------
-
-from utils.media_tools import extract_audio  # noqa
+# ----------------- extract audio from video -----------------
 
 
 async def handle_extract_audio(client: Client, cq: CallbackQuery, msg: Message):
@@ -652,7 +701,9 @@ async def handle_extract_audio(client: Client, cq: CallbackQuery, msg: Message):
 
     lock = get_lock(user_id)
     if lock.locked():
-        await cq.answer("Ek task already running hai, thoda wait karo.", show_alert=True)
+        await cq.answer(
+            "Ek task already running hai, thoda wait karo.", show_alert=True
+        )
         return
 
     await cq.answer()
@@ -663,9 +714,13 @@ async def handle_extract_audio(client: Client, cq: CallbackQuery, msg: Message):
         temp_root = Path(Config.TEMP_DIR) / str(user_id) / uuid.uuid4().hex
         temp_root.mkdir(parents=True, exist_ok=True)
 
-        await register_temp_path(user_id, str(temp_root), Config.AUTO_DELETE_DEFAULT_MIN)
+        await register_temp_path(
+            user_id, str(temp_root), Config.AUTO_DELETE_DEFAULT_MIN
+        )
 
-        status = await cq.message.reply_text("Downloading video for audio extract…")
+        status = await cq.message.reply_text(
+            "Downloading video for audio extract…"
+        )
 
         video_path = str(temp_root / file_name)
         start = asyncio.get_event_loop().time()
@@ -688,20 +743,53 @@ async def handle_extract_audio(client: Client, cq: CallbackQuery, msg: Message):
             return
 
         await status.edit_text("Audio ready, sending…")
-        await cq.message.chat.send_document(audio_path, caption=f"Extracted audio from {file_name}")
+        await cq.message.chat.send_document(
+            audio_path, caption=f"Extracted audio from {file_name}"
+        )
 
 
-# ---------- startup ----------
+# ----------------- tiny HTTP server for Render -----------------
+
+
+async def handle_root(request: web.Request) -> web.Response:
+    return web.Response(
+        text="Serena Unzip Bot is running ✅", content_type="text/plain"
+    )
+
+
+async def start_http_server() -> web.AppRunner:
+    app_http = web.Application()
+    app_http.router.add_get("/", handle_root)
+
+    port = int(os.environ.get("PORT", "10000"))
+    runner = web.AppRunner(app_http)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"HTTP server started on 0.0.0.0:{port}")
+    return runner
+
+
+# ----------------- main -----------------
+
 
 async def main():
-    # start cleanup worker in background
+    # start background cleanup worker
     asyncio.create_task(cleanup_worker())
+
+    # start Telegram bot
     await app.start()
     print("Serena Unzip bot started.")
-    await idle()
 
+    # start HTTP server for Render Web Service
+    http_runner = await start_http_server()
 
-from pyrogram import idle  # after defining main
+    try:
+        await idle()
+    finally:
+        # graceful shutdown
+        await app.stop()
+        await http_runner.cleanup()
 
 
 if __name__ == "__main__":
