@@ -1,3 +1,4 @@
+# utils/extractors.py
 import os
 import zipfile
 import tarfile
@@ -9,7 +10,7 @@ import rarfile
 
 VIDEO_EXT = {".mp4", ".mkv", ".mov", ".avi", ".webm"}
 PDF_EXT = {".pdf"}
-APK_EXT = {".apk", ".xapk"}
+APK_EXT = {".apk", ".xapk", ".apks"}
 TXT_EXT = {".txt"}
 M3U_EXT = {".m3u", ".m3u8"}
 
@@ -25,7 +26,7 @@ def _scan_stats(base_dir: Path) -> Dict[str, Any]:
         "others": 0,
         "folders": 0,
     }
-    files = []
+    files: List[str] = []
 
     for root, dirs, fls in os.walk(base_dir):
         rel_root = os.path.relpath(root, base_dir)
@@ -56,6 +57,54 @@ def _scan_stats(base_dir: Path) -> Dict[str, Any]:
     return {"stats": stats, "files": files}
 
 
+def _archive_type(path: str) -> Optional[str]:
+    """
+    Robust archive type detection based on suffixes and headers.
+    Returns: 'zip' | 'tar' | '7z' | 'rar' | None
+    """
+    p = Path(path)
+    lower = str(p).lower()
+    suffixes = "".join(p.suffixes).lower()
+
+    # explicit suffix combos
+    if suffixes.endswith(".zip"):
+        return "zip"
+    if suffixes.endswith((".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz")):
+        return "tar"
+    if suffixes.endswith(".tar"):
+        return "tar"
+    if suffixes.endswith(".7z"):
+        return "7z"
+    if suffixes.endswith(".rar"):
+        return "rar"
+
+    # fallback by single suffix
+    s = p.suffix.lower()
+    if s == ".zip":
+        return "zip"
+    if s in (".tar", ".gz", ".bz2", ".xz"):
+        return "tar"
+    if s == ".7z":
+        return "7z"
+    if s == ".rar":
+        return "rar"
+
+    # header based fallback
+    try:
+        if zipfile.is_zipfile(path):
+            return "zip"
+    except Exception:
+        pass
+
+    try:
+        with rarfile.RarFile(path) as _:
+            return "rar"
+    except Exception:
+        pass
+
+    return None
+
+
 def is_zip_encrypted(path: str) -> bool:
     try:
         with zipfile.ZipFile(path) as z:
@@ -68,23 +117,27 @@ def is_zip_encrypted(path: str) -> bool:
 
 
 def detect_encrypted(path: str) -> bool:
-    lower = path.lower()
-    if lower.endswith(".zip"):
+    """
+    Basic encrypted detection for zip/rar/7z.
+    """
+    t = _archive_type(path)
+    if t == "zip":
         return is_zip_encrypted(path)
-    # rar/7z detection basic: we just try to list
+
     try:
-        if lower.endswith(".rar"):
+        if t == "rar":
             with rarfile.RarFile(path) as rf:
                 _ = rf.infolist()
-        elif lower.endswith(".7z"):
+        elif t == "7z":
             with py7zr.SevenZipFile(path, mode="r") as z:
                 _ = z.getnames()
-    except rarfile.BadRarFile:
-        return False
+        else:
+            return False
     except (rarfile.NeedFirstVolume, rarfile.PasswordRequired, py7zr.exceptions.PasswordRequired):
         return True
     except Exception:
         return False
+
     return False
 
 
@@ -95,76 +148,38 @@ def extract_archive(
 ) -> Dict[str, Any]:
     """
     Extracts archive to dest_dir.
-    Supports: zip, rar, 7z, tar, tar.gz, tgz, tar.bz2
+    Supports: zip, rar, 7z, tar, tar.gz, tgz, tar.bz2, tbz2, gz, bz2
     Returns: { "stats": {...}, "files": [relative paths] }
     """
     Path(dest_dir).mkdir(parents=True, exist_ok=True)
-    lower = archive_path.lower()
+    t = _archive_type(archive_path)
 
-    if lower.endswith(".zip"):
+    if t is None:
+        raise ValueError("Unsupported archive format.")
+
+    if t == "zip":
         with zipfile.ZipFile(archive_path) as z:
             if password:
                 z.setpassword(password.encode("utf-8"))
             z.extractall(dest_dir)
-    elif lower.endswith((".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2")):
-        mode = "r:*"
-        with tarfile.open(archive_path, mode) as t:
-            if password:
-                # tar generally doesn't support password; ignore
-                pass
-            t.extractall(dest_dir)
-    elif lower.endswith(".7z"):
+
+    elif t == "tar":
+        # tarfile automatically handles .tar, .tar.gz, .tgz, .tar.bz2 etc.
+        with tarfile.open(archive_path, "r:*") as tfile:
+            # tar generally no password
+            tfile.extractall(dest_dir)
+
+    elif t == "7z":
         with py7zr.SevenZipFile(archive_path, mode="r", password=password) as z:
             z.extractall(dest_dir)
-    elif lower.endswith(".rar"):
+
+    elif t == "rar":
         with rarfile.RarFile(archive_path) as rf:
             if password:
                 rf.setpassword(password)
             rf.extractall(dest_dir)
+
     else:
         raise ValueError("Unsupported archive format.")
 
     return _scan_stats(Path(dest_dir))
-
-
-def extract_single_file(
-    archive_path: str,
-    dest_dir: str,
-    member_rel_path: str,
-    password: Optional[str] = None,
-) -> str:
-    """
-    Extract only one file from archive.
-    Returns absolute path of extracted file.
-    """
-    Path(dest_dir).mkdir(parents=True, exist_ok=True)
-    lower = archive_path.lower()
-    member_rel_path = member_rel_path.replace("\\", "/")
-
-    if lower.endswith(".zip"):
-        with zipfile.ZipFile(archive_path) as z:
-            if password:
-                z.setpassword(password.encode("utf-8"))
-            z.extract(member_rel_path, dest_dir)
-            return str(Path(dest_dir) / member_rel_path)
-    elif lower.endswith((".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2")):
-        with tarfile.open(archive_path, "r:*") as t:
-            t.extract(member_rel_path, dest_dir)
-            return str(Path(dest_dir) / member_rel_path)
-    elif lower.endswith(".7z"):
-        with py7zr.SevenZipFile(archive_path, mode="r", password=password) as z:
-            # py7zr cannot extract single directly by path easily,
-            # but we can filter by target
-            allnames = z.getnames()
-            if member_rel_path not in allnames:
-                raise FileNotFoundError(member_rel_path)
-            z.extract(targets=[member_rel_path], path=dest_dir)
-            return str(Path(dest_dir) / member_rel_path)
-    elif lower.endswith(".rar"):
-        with rarfile.RarFile(archive_path) as rf:
-            if password:
-                rf.setpassword(password)
-            rf.extract(member_rel_path, dest_dir)
-            return str(Path(dest_dir) / member_rel_path)
-    else:
-        raise ValueError("Unsupported archive format.")
