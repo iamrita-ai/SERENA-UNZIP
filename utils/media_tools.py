@@ -1,6 +1,6 @@
+# utils/media_tools.py
 import asyncio
 import os
-from pathlib import Path
 from typing import List
 
 
@@ -63,3 +63,25 @@ async def split_video(video_path: str, start: str, duration: str, output_path: s
         output_path
     ]
     await run_ffmpeg(cmd)
+
+
+async def generate_thumbnail(
+    video_path: str,
+    thumb_path: str,
+    time_pos: str = "00:00:02",
+):
+    """
+    Thumbnail generate karega video se:
+    ffmpeg -ss time_pos -i video -vframes 1 -q:v 2 thumb.jpg
+    """
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-ss", time_pos,
+        "-i", video_path,
+        "-vframes", "1",
+        "-q:v", "2",
+        thumb_path,
+    ]
+    await run_ffmpeg(cmd)
+    return thumb_path
