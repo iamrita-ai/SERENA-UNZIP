@@ -1841,6 +1841,7 @@ async def handle_m3u8_quality_choice(
     base_name = info["base_name"]
 
     chat_id = cq.message.chat.id
+    thread_id = getattr(cq.message, "message_thread_id", None)
     user = cq.from_user
     user_id = user.id
 
@@ -1873,6 +1874,7 @@ async def handle_m3u8_quality_choice(
         thumb=thumb_arg,
         progress=progress_for_pyrogram,
         progress_args=(cq.message, start_u, base_caption, "to Telegram"),
+        message_thread_id=thread_id,
     )
     try:
         await cq.message.delete()
@@ -1885,6 +1887,7 @@ async def handle_m3u8_quality_choice(
     except Exception:
         pass
     M3U8_TASKS.pop(task_id, None)
+    
 
 
 # ----------------- main (local run only; Render par server.py) -----------------
