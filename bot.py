@@ -427,6 +427,10 @@ def settings_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("🔤 Replace Words", callback_data="settings:replace"),
             ],
             [
+                InlineKeyboardButton("📸 Original Thumb", callback_data="settings:thumb:original"),
+                InlineKeyboardButton("🎲 Random Thumb", callback_data="settings:thumb:random"),
+            ],
+            [
                 InlineKeyboardButton("⚙️ Reset Settings", callback_data="settings:reset"),
             ],
             [
