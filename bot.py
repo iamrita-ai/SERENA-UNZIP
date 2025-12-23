@@ -79,7 +79,13 @@ EMOJI_LIST = [
 premium_until: Dict[int, float] = {}  # user_id -> timestamp until premium
 user_caption_settings: Dict[int, Dict[str, Any]] = {}  # user_id -> {base, counter, rfrom, rto, updated_at}
 pending_settings_action: Dict[int, str] = {}  # user_id -> "caption" | "replace"
+# thumbnail mode per user: 'original' or 'random'
+user_thumb_mode: Dict[int, str] = {}  # user_id -> mode
 
+
+def get_thumb_mode(user_id: int) -> str:
+    return user_thumb_mode.get(user_id, "random")
+    
 # link sessions (for TXT + messages): (chat_id, msg_id) -> {links, content}
 LINK_SESSIONS: Dict[Tuple[int, int], Dict[str, Any]] = {}
 
