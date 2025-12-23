@@ -114,19 +114,93 @@ def is_premium_user(user_id: int) -> bool:
 
 # ----------------- logging helpers -----------------
 
+# ----------------- logging helpers (topics per user) -----------------
+
 log_chat_info: Optional[Chat] = None
+log_is_forum: bool = False
+user_log_topics: Dict[int, int] = {}  # user_id -> topic_id (message_thread_id)
 
 
-async def get_log_chat_info(client: Client) -> Optional[Chat]:
-    global log_chat_info
+async def get_log_chat_info(client: Client) -> Tuple[Optional[Chat], bool]:
+    """
+    Returns (log_chat, is_forum)
+    """
+    global log_chat_info, log_is_forum
     if log_chat_info is not None:
-        return log_chat_info
+        return log_chat_info, log_is_forum
+
     try:
         chat = await client.get_chat(Config.LOG_CHANNEL_ID)
         log_chat_info = chat
+        # Pyrogram v1 may not have is_forum, so use getattr
+        log_is_forum = bool(getattr(chat, "is_forum", False))
     except Exception:
         log_chat_info = None
-    return log_chat_info
+        log_is_forum = False
+
+    return log_chat_info, log_is_forum
+
+
+async def get_user_log_target(client: Client, user) -> Tuple[Optional[int], Optional[int]]:
+    """
+    Returns (chat_id, thread_id or None).
+    If log chat is a forum AND message_thread_id supported, ensures a topic per user.
+    Otherwise falls back to main chat (no thread).
+    """
+    if not Config.LOG_CHANNEL_ID:
+        return None, None
+
+    chat_info, is_forum = await get_log_chat_info(client)
+    if not chat_info:
+        return None, None
+
+    chat_id = chat_info.id
+
+    # If not forum, all logs go to main chat
+    if not is_forum:
+        return chat_id, None
+
+    # If already have topic for user in memory
+    if user.id in user_log_topics:
+        return chat_id, user_log_topics[user.id]
+
+    # Try to create a topic per user (Pyrogram v2+ only)
+    if not hasattr(client, "create_forum_topic"):
+        # Old pyrogram: can't create topics reliably, fallback
+        return chat_id, None
+
+    topic_id = None
+    name = f"{user.first_name or 'User'} | {user.id}"
+    try:
+        topic_msg = await client.create_forum_topic(chat_id, name=name)
+        # New Pyrogram: topic_msg has .message_thread_id
+        topic_id = getattr(topic_msg, "message_thread_id", None)
+    except Exception:
+        topic_id = None
+
+    if topic_id is None:
+        # Fallback: no topic support, use main chat
+        return chat_id, None
+
+    user_log_topics[user.id] = topic_id
+
+    # Intro message inside that topic (ignore errors)
+    intro = (
+        f"👤 <b>User</b>\n"
+        f"• Name: <b>{user.first_name or ''}</b> (@{user.username or 'N/A'})\n"
+        f"• ID: <code>{user.id}</code>\n"
+        f"• First seen: <code>{time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())}</code>"
+    )
+    try:
+        # message_thread_id might not be supported on old Pyrogram; guard it
+        try:
+            await client.send_message(chat_id, intro, message_thread_id=topic_id)
+        except TypeError:
+            await client.send_message(chat_id, intro)
+    except Exception:
+        pass
+
+    return chat_id, topic_id
 
 
 async def log_user_input(client: Client, message: Message, context: str):
@@ -136,10 +210,9 @@ async def log_user_input(client: Client, message: Message, context: str):
     if not user:
         return
 
-    chat_info = await get_log_chat_info(client)
-    if not chat_info:
+    chat_id, thread_id = await get_user_log_target(client, user)
+    if not chat_id:
         return
-    chat_id = chat_info.id
 
     cap = (
         f"🔹 <b>INPUT</b>\n"
@@ -150,13 +223,31 @@ async def log_user_input(client: Client, message: Message, context: str):
     if message.caption:
         cap += f"\n\n{message.caption}"
 
+    # text log
     try:
-        await client.send_message(chat_id, cap)
+        if thread_id is not None:
+            try:
+                await client.send_message(chat_id, cap, message_thread_id=thread_id)
+            except TypeError:
+                await client.send_message(chat_id, cap)
+        else:
+            await client.send_message(chat_id, cap)
     except Exception:
         pass
 
+    # media copy
     try:
-        await message.copy(chat_id=chat_id, caption=cap)
+        if thread_id is not None:
+            try:
+                await message.copy(
+                    chat_id=chat_id,
+                    caption=cap,
+                    message_thread_id=thread_id,
+                )
+            except TypeError:
+                await message.copy(chat_id=chat_id, caption=cap)
+        else:
+            await message.copy(chat_id=chat_id, caption=cap)
     except Exception:
         pass
 
@@ -165,10 +256,9 @@ async def log_user_output(client: Client, user, msg: Message, context: str):
     if not Config.LOG_CHANNEL_ID or not user or not msg:
         return
 
-    chat_info = await get_log_chat_info(client)
-    if not chat_info:
+    chat_id, thread_id = await get_user_log_target(client, user)
+    if not chat_id:
         return
-    chat_id = chat_info.id
 
     cap = (
         f"✅ <b>OUTPUT</b>\n"
@@ -179,16 +269,33 @@ async def log_user_output(client: Client, user, msg: Message, context: str):
     if msg.caption:
         cap += f"\n\n{msg.caption}"
 
+    # text log
     try:
-        await client.send_message(chat_id, cap)
+        if thread_id is not None:
+            try:
+                await client.send_message(chat_id, cap, message_thread_id=thread_id)
+            except TypeError:
+                await client.send_message(chat_id, cap)
+        else:
+            await client.send_message(chat_id, cap)
     except Exception:
         pass
 
+    # media copy
     try:
-        await msg.copy(chat_id=chat_id, caption=cap)
+        if thread_id is not None:
+            try:
+                await msg.copy(
+                    chat_id=chat_id,
+                    caption=cap,
+                    message_thread_id=thread_id,
+                )
+            except TypeError:
+                await msg.copy(chat_id=chat_id, caption=cap)
+        else:
+            await msg.copy(chat_id=chat_id, caption=cap)
     except Exception:
         pass
-
 
 # ----------------- caption helpers -----------------
 
