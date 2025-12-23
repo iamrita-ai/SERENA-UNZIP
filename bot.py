@@ -334,6 +334,21 @@ def build_caption(user_id: int, default_caption: str) -> str:
         cfg["counter"] = counter
         caption = f"{counter:03d} {base}"
 
+async def choose_thumbnail(user_id: int, video_path: str) -> Optional[str]:
+    """
+    Choose thumbnail for a local video file based on user setting.
+    'original'  -> frame from the very start (00:00:00.2)
+    'random'    -> frame from a bit later (00:00:02)
+    """
+    mode = get_thumb_mode(user_id)
+    time_pos = "00:00:00.200" if mode == "original" else "00:00:02"
+
+    thumb_path = video_path + ".jpg"
+    try:
+        await generate_thumbnail(video_path, thumb_path, time_pos=time_pos)
+        return thumb_path
+    except Exception:
+        return None
     # Replace words
     rfrom = cfg.get("rfrom")
     rto = cfg.get("rto")
