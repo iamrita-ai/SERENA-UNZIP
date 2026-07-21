@@ -1,31 +1,30 @@
-# utils/progress.py
+# utils/progress.py — Fixed: no branding, handles total=0, PROGRESS_GIF support
+import asyncio
 import time
-from typing import Dict
+from typing import Dict, Optional
 
+from pyrogram.errors import FloodWait, MessageNotModified
 from pyrogram.types import Message
-
 from config import Config
 
-_last_update: Dict[int, float] = {}  # msg_id -> timestamp
+_last_update: Dict[int, float] = {}
 
 
 def human_bytes(size: int) -> str:
-    if size == 0:
+    if size <= 0:
         return "0 B"
-    power = 1024
-    n = 0
-    power_labels = ["B", "KB", "MB", "GB", "TB"]
     size = float(size)
-    while size >= power and n < len(power_labels) - 1:
-        size /= power
-        n += 1
-    return f"{size:.2f} {power_labels[n]}"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024:
+            return f"{size:.2f} {unit}"
+        size /= 1024
+    return f"{size:.2f} PB"
 
 
 def human_time(seconds: int) -> str:
-    if seconds < 0:
-        seconds = 0
-    m, s = divmod(seconds, 60)
+    if seconds <= 0:
+        return "0s"
+    m, s = divmod(int(seconds), 60)
     h, m = divmod(m, 60)
     if h:
         return f"{h}h {m}m {s}s"
@@ -34,53 +33,121 @@ def human_time(seconds: int) -> str:
     return f"{s}s"
 
 
+def _network_quality(speed_bps: float) -> str:
+    mb = speed_bps / (1024 * 1024)
+    if mb < 0.5:  return "🐢 Slow"
+    if mb < 3:    return "📶 Normal"
+    if mb < 10:   return "⚡ Fast"
+    return "🚀 Very Fast"
+
+
+async def _safe_edit_msg(message: Message, text: str):
+    """Edit text or caption depending on message type — handles errors gracefully."""
+    try:
+        if getattr(message, "animation", None) or getattr(message, "video", None):
+            await message.edit_caption(text)
+        else:
+            await message.edit_text(text)
+    except MessageNotModified:
+        pass
+    except FloodWait as e:
+        await asyncio.sleep(min(e.value, 10))
+        try:
+            if getattr(message, "animation", None) or getattr(message, "video", None):
+                await message.edit_caption(text)
+            else:
+                await message.edit_text(text)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+async def make_progress_message(client, chat_id: int, reply_to: int, text: str, thread_id: int = None) -> Optional[Message]:
+    """
+    Create progress status message.
+    If PROGRESS_GIF is set → send animation with caption (GIF shows during download).
+    Otherwise → plain text message.
+    """
+    gif = (Config.PROGRESS_GIF or "").strip()
+    if gif:
+        try:
+            return await client.send_animation(
+                chat_id, gif,
+                caption=text,
+                reply_to_message_id=reply_to,
+                message_thread_id=thread_id,
+            )
+        except Exception:
+            pass  # fallback to plain text
+    try:
+        return await client.send_message(
+            chat_id, text,
+            reply_to_message_id=reply_to,
+            message_thread_id=thread_id,
+        )
+    except Exception:
+        return None
+
+
 async def progress_for_pyrogram(
     current: int,
     total: int,
     message: Message,
     start_time: float,
     file_name: str,
-    direction: str = "to my server",
+    direction: str = "Downloading",
+    known_total: int = 0,    # ← pass finfo["size"] when Telegram total=0
 ):
     """
-    Pyrogram progress callback.
-    NOTE: start_time = time.time() hona chahiye. (bot.py me fix kiya gaya hai)
+    Upload/download progress callback for Pyrogram.
+    Handles total=0 (unknown file size) gracefully using known_total hint.
+    No branding — clean progress display.
     """
-    now = time.time()
+    now    = time.time()
     msg_id = message.id
-    last = _last_update.get(msg_id, 0)
-    if now - last < Config.PROGRESS_UPDATE_INTERVAL and current != total:
-        return
+    last   = _last_update.get(msg_id, 0)
 
+    # Throttle updates
+    if now - last < float(Config.PROGRESS_UPDATE_INTERVAL) and current != total:
+        return
     _last_update[msg_id] = now
 
-    if total <= 0:
-        percent = 0.0
+    elapsed = max(now - start_time, 0.001)
+    speed   = current / elapsed  # bytes/sec
+
+    # Use known_total as fallback when Telegram gives 0
+    actual_total = total if total > 0 else known_total
+
+    if actual_total > 0:
+        percent   = min((current * 100 / actual_total), 100.0)
+        filled    = int(20 * percent / 100)
+        bar       = "●" * filled + "○" * (20 - filled)   # dots style
+        remaining = actual_total - current
+        eta       = int(remaining / speed) if speed > 0 else 0
+        size_str  = f"{human_bytes(current)} of {human_bytes(actual_total)}"
+        pct_str   = f"{percent:.1f}%"
+        eta_str   = human_time(eta)
     else:
-        percent = current * 100 / total
+        # Total unknown — empty dots indeterminate bar
+        bar      = "○" * 20
+        pct_str  = "..."
+        size_str = human_bytes(current)
+        eta_str  = "calculating..."
 
-    elapsed = max(now - start_time, 1e-3)  # 0 se bachne ke liye
-    speed = current / elapsed  # bytes/sec
-    eta = int((total - current) / speed) if speed > 0 and total > 0 else 0
-
-    filled_len = int(20 * percent / 100)
-    bar = "●" * filled_len + "○" * (20 - filled_len)
-
+    icon = "📥" if "down" in direction.lower() else "📤"
     text = (
-        "➵⋆🪐ᴛᴇᴄʜɴɪᴄᴀʟ_sᴇʀᴇɴᴀ𓂃\n\n"
-        f"{file_name}\n"
-        f"{direction}\n"
+        f"{icon} <b>{direction}</b>\n\n"
+        f"📄 <code>{file_name}</code>\n"
         f" [{bar}] \n"
-        f"◌Progress😉:〘 {percent:.2f}% 〙\n"
-        f"Done: 〘{human_bytes(current)} of {human_bytes(total)}〙\n"
-        f"◌Speed🚀:〘 {human_bytes(int(speed))}/s 〙\n"
-        f"◌Time Left⏳:〘 {human_time(eta)} 〙"
+        f"◌ Progress 😉 : 〘 {pct_str} 〙\n"
+        f"✅ Done       : 〘 {size_str} 〙\n"
+        f"🚀 Speed      : 〘 {human_bytes(int(speed))}/s 〙\n"
+        f"⏳ ETA        : 〘 {eta_str} 〙\n"
+        f"📶 Network    : {_network_quality(speed)}"
     )
 
-    try:
-        await message.edit_text(text)
-    except Exception:
-        pass
+    await _safe_edit_msg(message, text)
 
-    if current == total and msg_id in _last_update:
+    if current == total and total > 0:
         _last_update.pop(msg_id, None)
